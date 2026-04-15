@@ -18,6 +18,8 @@ from utils.loss import (hybrid_magnitude_loss, magnitude_mse_loss, normalize_mag
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.ticker import FormatStrFormatter
 
+import torch.nn.functional as F
+
 
 def prepare_output_dir(model_path: str):
     os.makedirs(model_path, exist_ok=True)
@@ -80,11 +82,11 @@ def evaluate_and_save_random_test_samples(
 
             pred_mag = out["render"]
 
-            # gt_mag_np = magnitude.detach().cpu().numpy()
-            # pred_mag_np = pred_mag.detach().cpu().numpy()
-
-            gt_mag_np = normalize_mag_map(magnitude).detach().cpu().numpy()
+            gt_mag_np = magnitude.detach().cpu().numpy()
             pred_mag_np = pred_mag.detach().cpu().numpy()
+
+            # gt_mag_np = normalize_mag_map(magnitude).detach().cpu().numpy()
+            # pred_mag_np = pred_mag.detach().cpu().numpy()
 
             # fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
@@ -277,7 +279,7 @@ def training(model_params, opt_params, raw_args):
                 # dbg_gt_shape = normalize_mag_map(dbg_gt_mag)
                 # dbg_pred_shape = normalize_mag_map(dbg_pred_mag)
 
-                loss_val = weighted_l1_loss(dbg_pred_mag, dbg_gt_mag).item()
+                loss_val = F.l1_loss(dbg_pred_mag, dbg_gt_mag).item()
                 zero_val = torch.mean(torch.abs(dbg_gt_mag)).item()
                 ratio_val = loss_val / max(zero_val, 1e-12)
 
@@ -342,7 +344,7 @@ def training(model_params, opt_params, raw_args):
             #     return_terms=True,
             # )
 
-            loss = weighted_l1_loss(pred_mag, gt_mag)
+            loss = F.l1_loss(pred_mag, gt_mag)
             abs_loss_dbg = loss
             # topk_loss_dbg = 0.0
 
