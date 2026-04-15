@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, get_combined_args
 from gaussian_renderer import render
-from gaussian_renderer.measured_subcarrier_renderer import render_measured_subcarrier_beam
+from gaussian_renderer.beam_subcarrier import render_beam_subcarrier
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from torch.utils.data import DataLoader, Subset
@@ -65,7 +65,7 @@ def evaluate_and_save_random_test_samples(
     tx_pos = torch.tensor(
         scene.bs_position,
         dtype=torch.float32,
-        device=gaussians.get_xyz.device,
+        device=gaussians.get_plane_center.device,
     )
 
     print(f"[Evaluation] Rendering {num_samples} random test samples...")
@@ -74,8 +74,8 @@ def evaluate_and_save_random_test_samples(
         for rank, idx in enumerate(indices):
             magnitude, rx_pos = scene.test_set[idx]
 
-            rx_pos = rx_pos.to(gaussians.get_xyz.device)
-            magnitude = magnitude.to(gaussians.get_xyz.device)
+            rx_pos = rx_pos.to(gaussians.get_plane_center.device)
+            magnitude = magnitude.to(gaussians.get_plane_center.device)
             magnitude = magnitude.reshape(scene.beam_rows, scene.beam_cols)
 
             out = render_fn(rx_pos)
@@ -188,12 +188,16 @@ def training(model_params, opt_params, raw_args):
     save_run_args_txt(model_params.model_path, model_params, opt_params, raw_args)
 
     gaussians = GaussianModel(
-        target_gaussians =12_000,
+        target_gaussians =50_000,
         optimizer_type = opt_params.optimizer_type,
         device = str(device),
         init_range = 1,
+        num_beams=getattr(model_params, "num_beams", 100),
         num_subcarriers=getattr(model_params, "num_subcarriers", 100),
-        spectral_rank=getattr(model_params, "spectral_rank", 16),
+        plane_init_sigma_beam=getattr(model_params, "plane_init_sigma_beam", 0.70),
+        plane_init_sigma_subcarrier=getattr(model_params, "plane_init_sigma_subcarrier", 0.70),
+        plane_min_sigma=getattr(model_params, "plane_min_sigma", 0.25),
+        plane_max_sigma=getattr(model_params, "plane_max_sigma", 1.20),
     )
 
     scene = Scene(model_params, gaussians)
@@ -235,25 +239,12 @@ def training(model_params, opt_params, raw_args):
     use_measured_renderer = getattr(model_params, "renderer_mode", "beambeam") == "measured_subcarrier"
 
     def render_sample(rx_pos_local):
-        if use_measured_renderer:
-            return render_measured_subcarrier_beam(
-                rx_pos=rx_pos_local,
-                tx_pos=tx_pos,
-                pc=gaussians,
-                num_subcarriers=scene.num_subcarriers,
-                beam_shape=scene.beam_shape,
-                normalize_beam_weights=False,
-                weight_floor=1e-4,
-                output_layout=scene.output_layout,
-            )
-        return render(
+        return render_beam_subcarrier(
             rx_pos=rx_pos_local,
-            tx_pos=tx_pos,
             pc=gaussians,
-            rx_shape=scene.rx_shape,
-            tx_shape=scene.tx_shape,
-            normalize_beam_weights=False,
-            weight_floor=1e-4,
+            num_beams=scene.num_beams,
+            num_subcarriers=scene.num_subcarriers,
+            support_radius=getattr(model_params, "plane_support_radius", 1),
         )
 
     # --------------------------------------------------
@@ -352,12 +343,12 @@ def training(model_params, opt_params, raw_args):
 
             gaussians.optimizer.zero_grad(set_to_none=True)
             gaussians.dynamic_gain_optimizer.zero_grad(set_to_none=True)
-            gaussians.dynamic_spectral_optimizer.zero_grad(set_to_none=True)
+
             loss.backward()
             gaussians.accumulate_training_stats(importance=importance)
+
             gaussians.optimizer.step()
             gaussians.dynamic_gain_optimizer.step()
-            gaussians.dynamic_spectral_optimizer.step()
 
 
             # Densify and prune OFF FOR DEBUGGING
@@ -376,33 +367,26 @@ def training(model_params, opt_params, raw_args):
             
             if iteration > 1000 and iteration % 1000 == 0:
 
-                dyn_grad_norm = 0.0
+                plane_center_grad = 0.0 if gaussians._plane_center.grad is None else gaussians._plane_center.grad.norm().item()
+                plane_sigma_grad = 0.0 if gaussians._plane_log_sigma.grad is None else gaussians._plane_log_sigma.grad.norm().item()
+                opacity_grad = 0.0 if gaussians._opacity.grad is None else gaussians._opacity.grad.norm().item()
+
+                dyn_gain_grad = 0.0
                 for p in gaussians.dynamic_gain_net.parameters():
                     if p.grad is not None:
-                        dyn_grad_norm += p.grad.norm().item()
+                        dyn_gain_grad += p.grad.norm().item()
 
-                dyn_spec_grad_norm = 0.0
-                for p in gaussians.dynamic_spectral_net.parameters():
-                    if p.grad is not None:
-                        dyn_spec_grad_norm += p.grad.norm().item()
-                basis_grad_norm = 0.0 if gaussians.spectral_basis.grad is None else gaussians.spectral_basis.grad.norm().item()
-
-                with torch.no_grad():
-                    print(
-                        f"grad xyz={gaussians._xyz.grad.norm().item():.3e}, "
-                        f"opacity={gaussians._opacity.grad.norm().item():.3e}, "
-                        f"scaling={gaussians._scaling.grad.norm().item():.3e}, "
-                        f"rotation={gaussians._rotation.grad.norm().item():.3e}, "
-                        # f"gain_mag={gaussians._gain_mag.grad.norm().item():.3e}, "
-                        f"dyn_gain={dyn_grad_norm:.3e}, "
-                        f"dyn_spec={dyn_spec_grad_norm:.3e}, "
-                        f"basis={basis_grad_norm:.3e}"
-                    )
+                print(
+                    f"grad plane_center={plane_center_grad:.3e}, "
+                    f"plane_sigma={plane_sigma_grad:.3e}, "
+                    f"opacity={opacity_grad:.3e}, "
+                    f"dyn_gain={dyn_gain_grad:.3e}"
+                )
 
             if iteration > 0 and iteration % 1000 == 0:
                 avg_opacity = get_avg_opacity(gaussians)
                 print(
-                    f"nums of gaussians: {gaussians.get_xyz.shape[0]}, "
+                    f"nums of gaussians: {gaussians.get_plane_center.shape[0]}, "
                     f"Avg opacity: {avg_opacity:.4f}, "
                     f"abs_loss: {float(abs_loss_dbg):.8f}, "
                     # f"topk_loss: {float(topk_loss_dbg):.8f}, "

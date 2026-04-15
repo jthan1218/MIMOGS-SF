@@ -64,37 +64,17 @@ class Scene:
         self.gaussians = gaussians
 
         self.batch_size = 1 # batch size is fixed to 1
-        self.num_epochs = 10
+        self.num_epochs = 20
 
         self.datadir = os.path.abspath(args.source_path)
 
-        self.renderer_mode = getattr(args, "renderer_mode", "beambeam")
+        # beam-by-subcarrier only
+        self.num_beams = getattr(args, "num_beams", 100)
+        self.num_subcarriers = getattr(args, "num_subcarriers", 100)
 
-        if self.renderer_mode == "measured_subcarrier":
-            self.num_beams = getattr(args, "num_beams", 100)
-            self.num_subcarriers = getattr(args, "num_subcarriers", 100)
-            self.beam_shape = (getattr(args, "beam_h", 10), getattr(args, "beam_v", 10))
-            assert self.beam_shape[0] * self.beam_shape[1] == self.num_beams, "beam_h * beam_v must equal num_beams"
-            self.output_layout = getattr(args, "measured_output_layout", "beam_subcarrier")
-            if self.output_layout == "beam_subcarrier":
-                self.beam_rows = self.num_beams
-                self.beam_cols = self.num_subcarriers
-            elif self.output_layout == "subcarrier_beam":
-                self.beam_rows = self.num_subcarriers
-                self.beam_cols = self.num_beams
-            else:
-                raise ValueError(f"Unknown measured_output_layout: {self.output_layout}")
-            self.rx_shape = None
-            self.tx_shape = self.beam_shape
-        else:
-            self.beam_rows = args.rx_num_beams
-            self.beam_cols = args.tx_num_beams
-            self.rx_shape = (10, 10)
-            self.tx_shape = (10, 10)
-            self.num_beams = self.beam_rows
-            self.num_subcarriers = self.beam_cols
-            self.beam_shape = self.tx_shape
-            self.output_layout = "beam_beam"
+        # row = subcarrier, col = beam
+        self.beam_rows = self.num_subcarriers
+        self.beam_cols = self.num_beams
 
         # BS metadata
         yaml_file_path = os.path.join(self.datadir, "bs_info.yml")

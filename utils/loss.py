@@ -1,5 +1,5 @@
 import torch
-
+import torch.nn.functional as F
 
 def magnitude_mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.mean((pred - target) ** 2)

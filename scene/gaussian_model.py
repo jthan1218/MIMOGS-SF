@@ -103,7 +103,29 @@ class DynamicGainNet(nn.Module):
         )
         return self.net(feat)
 
+class DynamicGainNet2D(nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_frequencies: int = 6, init_gain: float = 1.0):
+        super().__init__()
+        self.plane_pe = FourierFeatures(in_dim=2, num_frequencies=num_frequencies, include_input=True)
+        self.rx_pe = FourierFeatures(in_dim=3, num_frequencies=num_frequencies, include_input=True)
 
+        in_dim = self.plane_pe.out_dim + self.rx_pe.out_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        nn.init.zeros_(self.net[-1].weight)
+        init_bias = float(inverse_softplus(torch.tensor(init_gain)))
+        nn.init.constant_(self.net[-1].bias, init_bias)
+
+    def forward(self, plane_coord_norm: torch.Tensor, rx_pos: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat([self.plane_pe(plane_coord_norm), self.rx_pe(rx_pos)], dim=-1)
+        return self.net(feat)
 
 class DynamicSpectralNet(nn.Module):
     def __init__(
@@ -168,49 +190,34 @@ class GaussianModel:
         optimizer_type: str = "default",
         device: str = "cuda",
         init_range: float = 5.0,
+        num_beams: int = 100,
         num_subcarriers: int = 100,
-        spectral_rank: int = 16,
+        plane_init_sigma_beam: float = 0.70,
+        plane_init_sigma_subcarrier: float = 0.70,
+        plane_min_sigma: float = 0.25,
+        plane_max_sigma: float = 1.20,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.optimizer_type = optimizer_type
         self.target_gaussians = target_gaussians
         self.init_range = init_range
-        self.num_subcarriers = num_subcarriers
-        self.spectral_rank = spectral_rank
 
-        self._xyz = torch.empty(0, device = self.device)
-        self._scaling = torch.empty(0, device = self.device)
-        self._rotation = torch.empty(0, device = self.device)
-        self._opacity = torch.empty(0, device = self.device)
-        # self._gain_mag = torch.empty(0, device = self.device)
+        self.num_beams = num_beams
+        self.num_subcarriers = num_subcarriers
+        self.plane_init_sigma_beam = plane_init_sigma_beam
+        self.plane_init_sigma_subcarrier = plane_init_sigma_subcarrier
+        self.plane_min_sigma = plane_min_sigma
+        self.plane_max_sigma = plane_max_sigma
+
+        self._plane_center = torch.empty(0, 2, device=self.device)
+        self._plane_log_sigma = torch.empty(0, 2, device=self.device)
+        self._opacity = torch.empty(0, 1, device=self.device)
 
         self.optimizer = None
-        self.xyz_scheduler_args = None
-
-        self.xyz_gradient_accum = torch.empty(0,device = self.device)
-        self.grad_denom = torch.empty(0,device = self.device)
-        self.importance_accum = torch.empty(0,device = self.device)
-        self.importance_denom = torch.empty(0,device = self.device)
-        
-        self.dynamic_gain_net = DynamicGainNet().to(self.device)
         self.dynamic_gain_optimizer = None
+
+        self.dynamic_gain_net = DynamicGainNet2D().to(self.device)
         self.dynamic_gain_scheduler_args = None
-
-        # measured subcarrier renderer용 spectral head
-        self.dynamic_spectral_net = DynamicSpectralNet(
-            out_dim=self.spectral_rank
-        ).to(self.device)
-
-        self.spectral_basis = nn.Parameter(
-            0.01 * torch.randn(
-                self.spectral_rank,
-                self.num_subcarriers,
-                device=self.device,
-            )
-        )
-
-        self.dynamic_spectral_optimizer = None
-        self.dynamic_spectral_scheduler_args = None
 
         self.setup_functions()
 
@@ -244,6 +251,17 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_plane_center(self):
+        return self._plane_center
+
+    @property
+    def get_plane_sigma(self):
+        return torch.exp(self._plane_log_sigma).clamp(
+            min=self.plane_min_sigma,
+            max=self.plane_max_sigma,
+        )
 
     # @property
     # def get_gain_mag(self):
@@ -302,34 +320,25 @@ class GaussianModel:
     
 
     def gaussian_init(self, vertices_path: Optional[str] = None):
-        fused_point_cloud = self._build_initial_points(vertices_path = vertices_path)
-        n_points = fused_point_cloud.shape[0]
+        n_points = self.target_gaussians
 
-        scene_scale = fused_point_cloud.std(dim = 0).mean().clamp(min = 1e-3)
-        init_scale = torch.full(
-            (n_points, 3),
-            0.5 * scene_scale.item(),
-            dtype = torch.float32,
-            device = self.device,
-        )
-        scales_raw = self.scaling_inverse_activation(init_scale)
+        beam_center = torch.rand((n_points, 1), device=self.device) * (self.num_beams - 1)
+        subc_center = torch.rand((n_points, 1), device=self.device) * (self.num_subcarriers - 1)
+        plane_center = torch.cat([beam_center, subc_center], dim=1)
 
-        rots = torch.zeros((n_points, 4), dtype = torch.float32, device = self.device)
-        rots[:, 0] = 1.0
+        init_sigma = torch.tensor(
+            [self.plane_init_sigma_beam, self.plane_init_sigma_subcarrier],
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, 2).repeat(n_points, 1)
 
         opacities_raw = self.inverse_opacity_activation(
-            0.1 * torch.ones((n_points, 1), dtype=torch.float32, device = self.device)
+            0.1 * torch.ones((n_points, 1), dtype=torch.float32, device=self.device)
         )
 
-        # gain_mag_raw = self.gain_mag_inverse_activation(
-        #     0.1 * torch.ones((n_points, 1), dtype = torch.float32, device = self.device)
-        # )
-
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._scaling = nn.Parameter(scales_raw.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._plane_center = nn.Parameter(plane_center.requires_grad_(True))
+        self._plane_log_sigma = nn.Parameter(torch.log(init_sigma).requires_grad_(True))
         self._opacity = nn.Parameter(opacities_raw.requires_grad_(True))
-        # self._gain_mag = nn.Parameter(gain_mag_raw.requires_grad_(True))
 
         self._reset_statistics()
         print(f"[GaussianModel] Number of points at initialization: {n_points}")
@@ -339,22 +348,14 @@ class GaussianModel:
             self.target_gaussians,
             self.optimizer_type,
             self.init_range,
-            self._xyz.detach(),
-            self._scaling.detach(),
-            self._rotation.detach(),
+            self.num_beams,
+            self.num_subcarriers,
+            self._plane_center.detach(),
+            self._plane_log_sigma.detach(),
             self._opacity.detach(),
-            # self._gain_mag.detach(),
-            self.xyz_gradient_accum.detach(),
-            self.grad_denom.detach(),
-            self.importance_accum.detach(),
-            self.importance_denom.detach(),
             None if self.optimizer is None else self.optimizer.state_dict(),
-
             self.dynamic_gain_net.state_dict(),
             None if self.dynamic_gain_optimizer is None else self.dynamic_gain_optimizer.state_dict(),
-            self.spectral_basis.detach(),
-            self.dynamic_spectral_net.state_dict(),
-            None if self.dynamic_spectral_optimizer is None else self.dynamic_spectral_optimizer.state_dict(),
         )
 
     def restore(self, model_args, training_args):
@@ -362,38 +363,24 @@ class GaussianModel:
             self.target_gaussians,
             self.optimizer_type,
             self.init_range,
-            xyz,
-            scaling,
-            rotation,
+            self.num_beams,
+            self.num_subcarriers,
+            plane_center,
+            plane_log_sigma,
             opacity,
-            # gain_mag,
-            xyz_gradient_accum,
-            grad_denom,
-            importance_accum,
-            importance_denom,
             opt_dict,
             dynamic_gain_net_dict,
             dynamic_gain_opt_dict,
-            spectral_basis,
-            dynamic_spectral_net_dict,
-            dynamic_spectral_opt_dict,
         ) = model_args
 
-        self._xyz = nn.Parameter(xyz.to(self.device).requires_grad_(True))
-        self._scaling = nn.Parameter(scaling.to(self.device).requires_grad_(True))
-        self._rotation = nn.Parameter(rotation.to(self.device).requires_grad_(True))
+        self._plane_center = nn.Parameter(plane_center.to(self.device).requires_grad_(True))
+        self._plane_log_sigma = nn.Parameter(plane_log_sigma.to(self.device).requires_grad_(True))
         self._opacity = nn.Parameter(opacity.to(self.device).requires_grad_(True))
-        self.spectral_basis = nn.Parameter(spectral_basis.to(self.device).requires_grad_(True))
-        # self._gain_mag = nn.Parameter(gain_mag.to(self.device).requires_grad_(True))
 
+        self._reset_statistics()
         self.training_setup(training_args)
 
-        self.xyz_gradient_accum = xyz_gradient_accum.to(self.device)
-        self.grad_denom = grad_denom.to(self.device)
-        self.importance_accum = importance_accum.to(self.device)
-        self.importance_denom = importance_denom.to(self.device)
-        
-        if opt_dict is not None:
+        if opt_dict is not None and self.optimizer is not None:
             self.optimizer.load_state_dict(opt_dict)
 
         if dynamic_gain_net_dict is not None:
@@ -402,51 +389,27 @@ class GaussianModel:
         if dynamic_gain_opt_dict is not None and self.dynamic_gain_optimizer is not None:
             self.dynamic_gain_optimizer.load_state_dict(dynamic_gain_opt_dict)
 
-        if dynamic_spectral_net_dict is not None:
-            self.dynamic_spectral_net.load_state_dict(dynamic_spectral_net_dict)
-
-        if dynamic_spectral_opt_dict is not None and self.dynamic_spectral_optimizer is not None:
-            self.dynamic_spectral_optimizer.load_state_dict(dynamic_spectral_opt_dict)
-
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
     def _reset_statistics(self):
-        n = self._xyz.shape[0]
-        self.xyz_gradient_accum = torch.zeros((n, 1), device = self.device)
-        self.grad_denom = torch.zeros((n, 1), device = self.device)
-        self.importance_accum = torch.zeros((n, 1), device = self.device)
-        self.importance_denom = torch.zeros((n, 1), device = self.device)
+        n = self._plane_center.shape[0]
+        self.importance_accum = torch.zeros((n, 1), device=self.device)
+        self.importance_denom = torch.zeros((n, 1), device=self.device)
 
     def training_setup(self, training_args):
         self._reset_statistics()
 
         param_groups = [
-            {"params": [self._xyz], "lr": training_args.position_lr_init, "name": "xyz"},
+            {"params": [self._plane_center], "lr": training_args.plane_center_lr, "name": "plane_center"},
+            {"params": [self._plane_log_sigma], "lr": training_args.plane_sigma_lr, "name": "plane_sigma"},
             {"params": [self._opacity], "lr": training_args.opacity_lr, "name": "opacity"},
-            {"params": [self._scaling], "lr": training_args.scaling_lr, "name": "scaling"},
-            {"params": [self._rotation], "lr": training_args.rotation_lr, "name": "rotation"},
-            # {"params": [self._gain_mag], "lr": training_args.gain_lr, "name": "gain_mag"},
         ]
 
         if getattr(training_args, "optimizer_type", self.optimizer_type) == "adamw":
-            self.optimizer = torch.optim.AdamW(param_groups, lr = 0.0, eps = 1e-8)
+            self.optimizer = torch.optim.AdamW(param_groups, lr=0.0, eps=1e-8)
         else:
-            self.optimizer = torch.optim.Adam(param_groups, lr = 0.0, eps = 1e-8)
-
-        self.xyz_scheduler_args = get_expon_lr_func(
-            lr_init = training_args.position_lr_init,
-            lr_final = training_args.position_lr_final,
-            lr_delay_mult = training_args.position_lr_delay_mult,
-            max_steps = training_args.position_lr_max_steps,
-        )
-
-        self.opacity_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.opacity_lr,
-            lr_final=training_args.opacity_lr_final,
-            lr_delay_mult=1.0,
-            max_steps=training_args.iterations,
-        )
+            self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-8)
 
         self.dynamic_gain_optimizer = torch.optim.Adam(
             self.dynamic_gain_net.parameters(),
@@ -461,40 +424,11 @@ class GaussianModel:
             max_steps=training_args.iterations,
         )
 
-        self.dynamic_spectral_optimizer = torch.optim.Adam(
-            [
-                {"params": self.dynamic_spectral_net.parameters()},
-                {"params": [self.spectral_basis]},
-            ],
-            lr=training_args.dynamic_spectral_lr,
-            eps=1e-8,
-        )
-
-        self.dynamic_spectral_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.dynamic_spectral_lr,
-            lr_final=training_args.dynamic_spectral_lr_final,
-            lr_delay_mult=1.0,
-            max_steps=training_args.iterations,
-        )
-
     def update_learning_rate(self, iteration):
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group["lr"] = lr
-            elif param_group["name"] == "opacity":
-                lr = self.opacity_scheduler_args(iteration)
-                param_group["lr"] = lr
-
         if self.dynamic_gain_optimizer is not None:
-            dyn_lr = self.dynamic_gain_scheduler_args(iteration)
+            gain_lr = self.dynamic_gain_scheduler_args(iteration)
             for param_group in self.dynamic_gain_optimizer.param_groups:
-                param_group["lr"] = dyn_lr
-
-        if self.dynamic_spectral_optimizer is not None:
-            spec_lr = self.dynamic_spectral_scheduler_args(iteration)
-            for param_group in self.dynamic_spectral_optimizer.param_groups:
-                param_group["lr"] = spec_lr
+                param_group["lr"] = gain_lr
 
     def _build_condition_feature(self, rx_pos: torch.Tensor) -> torch.Tensor:
         rx = rx_pos.view(1, 3).to(self.device, dtype=self.get_xyz.dtype)
@@ -511,10 +445,16 @@ class GaussianModel:
         return feat
 
     def get_dynamic_gain_weight(self, rx_pos: torch.Tensor) -> torch.Tensor:
-        feat = self._build_condition_feature(rx_pos)
-        dynamic_gain = F.softplus(self.dynamic_gain_net(feat))
-        gain_weight = self.get_opacity * dynamic_gain
-        return gain_weight
+        rx_pos = rx_pos.view(1, 3).to(self.device, dtype=self._plane_center.dtype)
+        rx_expand = rx_pos.expand(self._plane_center.shape[0], -1)
+
+        beam_norm = 2.0 * self._plane_center[:, 0:1] / max(self.num_beams - 1, 1) - 1.0
+        subc_norm = 2.0 * self._plane_center[:, 1:2] / max(self.num_subcarriers - 1, 1) - 1.0
+        plane_coord_norm = torch.cat([beam_norm, subc_norm], dim=-1)
+
+        dyn = F.softplus(self.dynamic_gain_net(plane_coord_norm, rx_expand))
+        gain = self.get_opacity * dyn
+        return gain
 
     def get_dynamic_spectral_profile(self, rx_pos, num_subcarriers=None):
         feat = self._build_condition_feature(rx_pos)
@@ -536,19 +476,12 @@ class GaussianModel:
     # Statistics for pruning / densification
     # ------------------------------------------------------------------
 
-    def accumulate_training_stats(self, importance: Optional[torch.Tensor] = None):
-        if self._xyz.grad is None:
+    def accumulate_training_stats(self, importance=None):
+        if importance is None:
             return
-
-        xyz_grad = torch.norm(self._xyz.grad.detach(), dim=-1, keepdim=True)
-        self.xyz_gradient_accum += xyz_grad
-        self.grad_denom += 1.0
-
-        if importance is not None:
-            if importance.dim() == 1:
-                importance = importance.unsqueeze(-1)
-            self.importance_accum += importance.detach().to(self.device)
-            self.importance_denom += 1.0
+        imp = importance.detach().reshape(-1, 1)
+        self.importance_accum += imp
+        self.importance_denom += 1.0
 
     def get_avg_xyz_grad(self):
         denom = torch.clamp(self.grad_denom, min=1.0)
@@ -568,25 +501,50 @@ class GaussianModel:
         # attrs += ["gain_mag"]
         return attrs
 
-    def save_ply(self, path: str):
-        mkdir_p(os.path.dirname(path))
+    def save_ply(self, path):
 
-        xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        opacities = self.get_opacity.detach().cpu().numpy()
-        scales = self.get_scaling.detach().cpu().numpy()
-        rotations = self.get_rotation.detach().cpu().numpy()
-        # gain_mag = self.get_gain_mag.detach().cpu().numpy()
 
-        dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            [xyz, normals, opacities, scales, rotations], axis = 1
+        centers = self._plane_center.detach().cpu().numpy()          # (N,2)
+        sigmas = self.get_plane_sigma.detach().cpu().numpy()         # (N,2)
+        opacity = self.get_opacity.detach().cpu().numpy().reshape(-1)
+
+        n = centers.shape[0]
+
+        # pseudo-3D coordinates for visualization / compatibility
+        # x = beam center, y = subcarrier center, z = 0
+        xyz = np.zeros((n, 3), dtype=np.float32)
+        xyz[:, 0] = centers[:, 0]
+        xyz[:, 1] = centers[:, 1]
+        xyz[:, 2] = 0.0
+
+        # store sigma info too
+        sigma_beam = sigmas[:, 0].astype(np.float32)
+        sigma_subc = sigmas[:, 1].astype(np.float32)
+        opacity = opacity.astype(np.float32)
+
+        vertex_data = np.empty(
+            n,
+            dtype=[
+                ("x", "f4"),
+                ("y", "f4"),
+                ("z", "f4"),
+                ("opacity", "f4"),
+                ("sigma_beam", "f4"),
+                ("sigma_subcarrier", "f4"),
+            ],
         )
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, "vertex")
-        PlyData([el]).write(path)
+
+        vertex_data["x"] = xyz[:, 0]
+        vertex_data["y"] = xyz[:, 1]
+        vertex_data["z"] = xyz[:, 2]
+        vertex_data["opacity"] = opacity
+        vertex_data["sigma_beam"] = sigma_beam
+        vertex_data["sigma_subcarrier"] = sigma_subc
+
+        ply = PlyData([PlyElement.describe(vertex_data, "vertex")], text=True)
+        ply.write(path)
 
     def load_ply(self, path: str):
         plydata = PlyData.read(path)

@@ -46,28 +46,22 @@ class ParamGroup:
 
 
 class ModelParams(ParamGroup):
-    """
-    MIMOGS model/data level arguments
-    """
-
     def __init__(self, parser: ArgumentParser, sentinel: bool = False):
         self._source_path = "./dataset/measured_LuViRA_100by100"
         self._model_path = ""
         self.data_device = "cuda"
         self.eval = False
 
-        # beam x beam renderer defaults
-        self.rx_num_beams = 100
-        self.tx_num_beams = 100
-
-        # measured beam x subcarrier renderer defaults
-        self.renderer_mode = "measured_subcarrier"
+        # beam-by-subcarrier only
         self.num_beams = 100
         self.num_subcarriers = 100
-        self.beam_h = 10
-        self.beam_v = 10
-        self.measured_output_layout = "beam_subcarrier"
-        self.spectral_rank = 16
+
+        # local 2D splat
+        self.plane_support_radius = 1
+        self.plane_init_sigma_beam = 0.70
+        self.plane_init_sigma_subcarrier = 0.70
+        self.plane_min_sigma = 0.25
+        self.plane_max_sigma = 1.20
 
         self.init_mode = "random"
         self.vertices_path = ""
@@ -87,29 +81,17 @@ class ModelParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser: ArgumentParser):
         self.iterations = 200_000
-        self.position_lr_init = 0.0016
-        self.position_lr_final = 0.000016
-        self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 0
-
-        self.opacity_lr = 0.025
-        # self.scaling_lr = 0.005
-        self.scaling_lr = 0.003
-        # self.rotation_lr = 0.001
-        self.rotation_lr = 0.0005
         self.optimizer_type = "default"
 
-        # self.gain_lr = 0.0025
+        # plane rasterizer params
+        self.plane_center_lr = 0.01
+        self.plane_sigma_lr = 0.003
+        self.opacity_lr = 0.025
         self.opacity_lr_final = 0.003
-        # self.gain_lr_final = 0.0003
 
-        # dynamic gain head
+        # dynamic gain head only
         self.dynamic_gain_lr = 0.001
         self.dynamic_gain_lr_final = 0.0001
-
-        # dynamic spectral head for measured renderer
-        self.dynamic_spectral_lr = 0.001
-        self.dynamic_spectral_lr_final = 0.0001
 
         super().__init__(parser, "Optimization Parameters")
 
