@@ -188,7 +188,7 @@ def training(model_params, opt_params, raw_args):
     save_run_args_txt(model_params.model_path, model_params, opt_params, raw_args)
 
     gaussians = GaussianModel(
-        target_gaussians =15_000,
+        target_gaussians =12_000,
         optimizer_type = opt_params.optimizer_type,
         device = str(device),
         init_range = 1,
@@ -279,7 +279,7 @@ def training(model_params, opt_params, raw_args):
                 # dbg_gt_shape = normalize_mag_map(dbg_gt_mag)
                 # dbg_pred_shape = normalize_mag_map(dbg_pred_mag)
 
-                loss_val = F.l1_loss(dbg_pred_mag, dbg_gt_mag).item()
+                loss_val = weighted_l1_loss(dbg_pred_mag, dbg_gt_mag).item()
                 zero_val = torch.mean(torch.abs(dbg_gt_mag)).item()
                 ratio_val = loss_val / max(zero_val, 1e-12)
 
@@ -344,7 +344,7 @@ def training(model_params, opt_params, raw_args):
             #     return_terms=True,
             # )
 
-            loss = F.l1_loss(pred_mag, gt_mag)
+            loss = weighted_l1_loss(pred_mag, gt_mag)
             abs_loss_dbg = loss
             # topk_loss_dbg = 0.0
 
