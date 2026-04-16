@@ -93,6 +93,8 @@ class OptimizationParams(ParamGroup):
         # plane rasterizer params
         self.plane_center_lr = 0.01
         self.plane_sigma_lr = 0.003
+        self.plane_center_lr_final = 0.001
+        self.plane_sigma_lr_final = 0.0003
         self.opacity_lr = 0.025
         self.opacity_lr_final = 0.003
 

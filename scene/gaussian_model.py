@@ -277,6 +277,8 @@ class GaussianModel:
         self.dynamic_gain_net = DynamicGainNet2D().to(self.device)
         self.dynamic_center_net = DynamicCenterNet2D().to(self.device)
         self.dynamic_sigma_net = DynamicSigmaNet2D().to(self.device)
+        self.plane_center_scheduler_args = None
+        self.plane_sigma_scheduler_args = None
         self.dynamic_gain_scheduler_args = None
         self.dynamic_center_scheduler_args = None
         self.dynamic_sigma_scheduler_args = None
@@ -491,6 +493,19 @@ class GaussianModel:
         else:
             self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-8)
 
+        self.plane_center_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.plane_center_lr,
+            lr_final=getattr(training_args, "plane_center_lr_final", training_args.plane_center_lr),
+            lr_delay_mult=1.0,
+            max_steps=training_args.iterations,
+        )
+        self.plane_sigma_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.plane_sigma_lr,
+            lr_final=getattr(training_args, "plane_sigma_lr_final", training_args.plane_sigma_lr),
+            lr_delay_mult=1.0,
+            max_steps=training_args.iterations,
+        )
+
         self.dynamic_gain_optimizer = torch.optim.Adam(
             self.dynamic_gain_net.parameters(),
             lr=getattr(training_args, "dynamic_gain_lr", 0.001),
@@ -527,6 +542,15 @@ class GaussianModel:
         )
 
     def update_learning_rate(self, iteration):
+        if self.optimizer is not None:
+            plane_center_lr = self.plane_center_scheduler_args(iteration)
+            plane_sigma_lr = self.plane_sigma_scheduler_args(iteration)
+            for param_group in self.optimizer.param_groups:
+                if param_group.get("name") == "plane_center":
+                    param_group["lr"] = plane_center_lr
+                elif param_group.get("name") == "plane_sigma":
+                    param_group["lr"] = plane_sigma_lr
+
         if self.dynamic_gain_optimizer is not None:
             gain_lr = self.dynamic_gain_scheduler_args(iteration)
             for param_group in self.dynamic_gain_optimizer.param_groups:

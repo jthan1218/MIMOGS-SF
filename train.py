@@ -14,7 +14,7 @@ from gaussian_renderer.beam_subcarrier import render_beam_subcarrier
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from torch.utils.data import DataLoader, Subset
-from utils.loss import (hybrid_magnitude_loss, magnitude_mse_loss, normalize_mag_map, weighted_l1_loss)
+from utils.loss import (hybrid_magnitude_loss, magnitude_mse_loss, normalize_mag_map, weighted_l1_loss, topk_shape_loss)
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.ticker import FormatStrFormatter
 
@@ -56,6 +56,7 @@ def evaluate_and_save_random_test_samples(
 ):
     save_dir = os.path.join(model_params.model_path, "pred_compare")
     os.makedirs(save_dir, exist_ok=True)
+    npy_path = os.path.join(model_params.model_path, "pred_compare_samples.npy")
 
     total = len(scene.test_set)
     num_samples = min(num_samples, total)
@@ -69,6 +70,9 @@ def evaluate_and_save_random_test_samples(
     )
 
     print(f"[Evaluation] Rendering {num_samples} random test samples...")
+    gt_list = []
+    pred_list = []
+    sample_indices = []
 
     with torch.no_grad():
         for rank, idx in enumerate(indices):
@@ -84,6 +88,9 @@ def evaluate_and_save_random_test_samples(
 
             gt_mag_np = magnitude.detach().cpu().numpy()
             pred_mag_np = pred_mag.detach().cpu().numpy()
+            gt_list.append(gt_mag_np)
+            pred_list.append(pred_mag_np)
+            sample_indices.append(idx)
 
             # gt_mag_np = normalize_mag_map(magnitude).detach().cpu().numpy()
             # pred_mag_np = pred_mag.detach().cpu().numpy()
@@ -139,7 +146,14 @@ def evaluate_and_save_random_test_samples(
             plt.savefig(fig_path, dpi=150)
             plt.close(fig)
 
+    packed = {
+        "indices": np.asarray(sample_indices, dtype=np.int64),
+        "gt": np.stack(gt_list, axis=0),
+        "pred": np.stack(pred_list, axis=0),
+    }
+    np.save(npy_path, packed)
     print(f"[Eval] Saved comparison figures to {save_dir}")
+    print(f"[Eval] Saved packed sample arrays to {npy_path}")
 
 def get_avg_opacity(gaussians) -> float:
     with torch.no_grad():
@@ -342,8 +356,6 @@ def training(model_params, opt_params, raw_args):
             # )
 
             loss = weighted_l1_loss(pred_mag, gt_mag)
-            abs_loss_dbg = loss
-            # topk_loss_dbg = 0.0
 
             assert_finite("loss", loss, iteration)
 
@@ -408,8 +420,7 @@ def training(model_params, opt_params, raw_args):
                 print(
                     f"nums of gaussians: {gaussians.get_plane_center.shape[0]}, "
                     f"Avg opacity: {avg_opacity:.4f}, "
-                    f"abs_loss: {float(abs_loss_dbg):.8f}, "
-                    # f"topk_loss: {float(topk_loss_dbg):.8f}, "
+                    f"Weighted l1 loss: {float(loss):.8f}, "
                 )
 
             ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
