@@ -249,10 +249,22 @@ def training(model_params, opt_params, raw_args):
     total_iterations = len(scene.train_iter) * num_epochs
     opt_params.position_lr_max_steps = int(0.6 * total_iterations) 
     gaussians.training_setup(opt_params)
-    densify_start_iter = 3000
-    densify_end_iter = 30000
-    densify_interval = 2000
-    opacity_reset_interval = 3000
+
+
+    iters_per_epoch = len(scene.train_iter)
+    total_iterations = iters_per_epoch * num_epochs
+
+    densify_start_epoch = 2
+    densify_end_epoch_ratio = 0.18
+    densify_every_epoch = 1
+    opacity_reset_every_epoch = 1.5
+
+    densify_start_iter = max(1, int(densify_start_epoch * iters_per_epoch))
+    densify_end_iter = max(densify_start_iter + 1, int(num_epochs * densify_end_epoch_ratio * iters_per_epoch))
+    densify_interval = max(1, int(densify_every_epoch * iters_per_epoch))
+    opacity_reset_interval = max(1, int(opacity_reset_every_epoch * iters_per_epoch))
+
+    
     importance_quantile = 0.90
     clone_sigma_threshold = 0.45
     split_sigma_threshold = 0.55
