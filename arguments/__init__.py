@@ -63,6 +63,13 @@ class ModelParams(ParamGroup):
         self.plane_min_sigma = 0.25
         self.plane_max_sigma = 1.20
 
+        self.use_dynamic_center = True
+        self.use_dynamic_sigma = True
+        self.center_shift_max_beam = 1.5
+        self.center_shift_max_subcarrier = 1.5
+        self.sigma_log_shift_max_beam = 0.5
+        self.sigma_log_shift_max_subcarrier = 0.5
+
         self.init_mode = "random"
         self.vertices_path = ""
 
@@ -92,6 +99,10 @@ class OptimizationParams(ParamGroup):
         # dynamic gain head only
         self.dynamic_gain_lr = 0.001
         self.dynamic_gain_lr_final = 0.0001
+        self.dynamic_center_lr = 0.001
+        self.dynamic_center_lr_final = 0.0001
+        self.dynamic_sigma_lr = 0.001
+        self.dynamic_sigma_lr_final = 0.0001
 
         super().__init__(parser, "Optimization Parameters")
 

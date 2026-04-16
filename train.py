@@ -198,6 +198,12 @@ def training(model_params, opt_params, raw_args):
         plane_init_sigma_subcarrier=getattr(model_params, "plane_init_sigma_subcarrier", 0.70),
         plane_min_sigma=getattr(model_params, "plane_min_sigma", 0.25),
         plane_max_sigma=getattr(model_params, "plane_max_sigma", 1.20),
+        use_dynamic_center=getattr(model_params, "use_dynamic_center", True),
+        use_dynamic_sigma=getattr(model_params, "use_dynamic_sigma", True),
+        center_shift_max_beam=getattr(model_params, "center_shift_max_beam", 1.5),
+        center_shift_max_subcarrier=getattr(model_params, "center_shift_max_subcarrier", 1.5),
+        sigma_log_shift_max_beam=getattr(model_params, "sigma_log_shift_max_beam", 0.5),
+        sigma_log_shift_max_subcarrier=getattr(model_params, "sigma_log_shift_max_subcarrier", 0.5),
     )
 
     scene = Scene(model_params, gaussians)
@@ -343,12 +349,16 @@ def training(model_params, opt_params, raw_args):
 
             gaussians.optimizer.zero_grad(set_to_none=True)
             gaussians.dynamic_gain_optimizer.zero_grad(set_to_none=True)
+            gaussians.dynamic_center_optimizer.zero_grad(set_to_none=True)
+            gaussians.dynamic_sigma_optimizer.zero_grad(set_to_none=True)
 
             loss.backward()
             gaussians.accumulate_training_stats(importance=importance)
 
             gaussians.optimizer.step()
             gaussians.dynamic_gain_optimizer.step()
+            gaussians.dynamic_center_optimizer.step()
+            gaussians.dynamic_sigma_optimizer.step()
 
 
             # Densify and prune OFF FOR DEBUGGING
@@ -375,12 +385,22 @@ def training(model_params, opt_params, raw_args):
                 for p in gaussians.dynamic_gain_net.parameters():
                     if p.grad is not None:
                         dyn_gain_grad += p.grad.norm().item()
+                dyn_center_grad = 0.0
+                for p in gaussians.dynamic_center_net.parameters():
+                    if p.grad is not None:
+                        dyn_center_grad += p.grad.norm().item()
+                dyn_sigma_grad = 0.0
+                for p in gaussians.dynamic_sigma_net.parameters():
+                    if p.grad is not None:
+                        dyn_sigma_grad += p.grad.norm().item()
 
                 print(
                     f"grad plane_center={plane_center_grad:.3e}, "
                     f"plane_sigma={plane_sigma_grad:.3e}, "
                     f"opacity={opacity_grad:.3e}, "
-                    f"dyn_gain={dyn_gain_grad:.3e}"
+                    f"dyn_gain={dyn_gain_grad:.3e}, "
+                    f"dyn_center={dyn_center_grad:.3e}, "
+                    f"dyn_sigma={dyn_sigma_grad:.3e}"
                 )
 
             if iteration > 0 and iteration % 1000 == 0:

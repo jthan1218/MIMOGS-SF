@@ -12,8 +12,8 @@ def render_beam_subcarrier(
     rx_pos = rx_pos.view(1, 3).to(pc.device, dtype=pc.get_plane_center.dtype)
 
     gains = pc.get_dynamic_gain_weight(rx_pos).squeeze(-1)      # (N,)
-    centers = pc.get_plane_center                               # (N,2) [beam, subcarrier]
-    sigmas = pc.get_plane_sigma                                 # (N,2)
+    centers = pc.get_dynamic_plane_center(rx_pos)               # (N,2) [beam, subcarrier]
+    sigmas = pc.get_dynamic_plane_sigma(rx_pos)                 # (N,2)
 
     device = centers.device
     dtype = centers.dtype
@@ -67,4 +67,8 @@ def render_beam_subcarrier(
         "gain_weight": gains,
         "plane_centers": centers,
         "plane_sigmas": sigmas,
+        "plane_centers_base": pc.get_plane_center,
+        "plane_centers_dynamic": centers,
+        "plane_sigmas_base": pc.get_plane_sigma,
+        "plane_sigmas_dynamic": sigmas,
     }

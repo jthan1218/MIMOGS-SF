@@ -127,6 +127,50 @@ class DynamicGainNet2D(nn.Module):
         feat = torch.cat([self.plane_pe(plane_coord_norm), self.rx_pe(rx_pos)], dim=-1)
         return self.net(feat)
 
+class DynamicCenterNet2D(nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_frequencies: int = 6):
+        super().__init__()
+        self.plane_pe = FourierFeatures(in_dim=2, num_frequencies=num_frequencies, include_input=True)
+        self.rx_pe = FourierFeatures(in_dim=3, num_frequencies=num_frequencies, include_input=True)
+
+        in_dim = self.plane_pe.out_dim + self.rx_pe.out_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, plane_coord_norm: torch.Tensor, rx_pos: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat([self.plane_pe(plane_coord_norm), self.rx_pe(rx_pos)], dim=-1)
+        return self.net(feat)
+
+class DynamicSigmaNet2D(nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_frequencies: int = 6):
+        super().__init__()
+        self.plane_pe = FourierFeatures(in_dim=2, num_frequencies=num_frequencies, include_input=True)
+        self.rx_pe = FourierFeatures(in_dim=3, num_frequencies=num_frequencies, include_input=True)
+
+        in_dim = self.plane_pe.out_dim + self.rx_pe.out_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, plane_coord_norm: torch.Tensor, rx_pos: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat([self.plane_pe(plane_coord_norm), self.rx_pe(rx_pos)], dim=-1)
+        return self.net(feat)
+
 class DynamicSpectralNet(nn.Module):
     def __init__(
         self,
@@ -196,6 +240,12 @@ class GaussianModel:
         plane_init_sigma_subcarrier: float = 0.70,
         plane_min_sigma: float = 0.25,
         plane_max_sigma: float = 1.20,
+        use_dynamic_center: bool = True,
+        use_dynamic_sigma: bool = True,
+        center_shift_max_beam: float = 1.5,
+        center_shift_max_subcarrier: float = 1.5,
+        sigma_log_shift_max_beam: float = 0.5,
+        sigma_log_shift_max_subcarrier: float = 0.5,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.optimizer_type = optimizer_type
@@ -208,6 +258,12 @@ class GaussianModel:
         self.plane_init_sigma_subcarrier = plane_init_sigma_subcarrier
         self.plane_min_sigma = plane_min_sigma
         self.plane_max_sigma = plane_max_sigma
+        self.use_dynamic_center = use_dynamic_center
+        self.use_dynamic_sigma = use_dynamic_sigma
+        self.center_shift_max_beam = center_shift_max_beam
+        self.center_shift_max_subcarrier = center_shift_max_subcarrier
+        self.sigma_log_shift_max_beam = sigma_log_shift_max_beam
+        self.sigma_log_shift_max_subcarrier = sigma_log_shift_max_subcarrier
 
         self._plane_center = torch.empty(0, 2, device=self.device)
         self._plane_log_sigma = torch.empty(0, 2, device=self.device)
@@ -215,9 +271,15 @@ class GaussianModel:
 
         self.optimizer = None
         self.dynamic_gain_optimizer = None
+        self.dynamic_center_optimizer = None
+        self.dynamic_sigma_optimizer = None
 
         self.dynamic_gain_net = DynamicGainNet2D().to(self.device)
+        self.dynamic_center_net = DynamicCenterNet2D().to(self.device)
+        self.dynamic_sigma_net = DynamicSigmaNet2D().to(self.device)
         self.dynamic_gain_scheduler_args = None
+        self.dynamic_center_scheduler_args = None
+        self.dynamic_sigma_scheduler_args = None
 
         self.setup_functions()
 
@@ -356,22 +418,28 @@ class GaussianModel:
             None if self.optimizer is None else self.optimizer.state_dict(),
             self.dynamic_gain_net.state_dict(),
             None if self.dynamic_gain_optimizer is None else self.dynamic_gain_optimizer.state_dict(),
+            self.dynamic_center_net.state_dict(),
+            self.dynamic_sigma_net.state_dict(),
+            None if self.dynamic_center_optimizer is None else self.dynamic_center_optimizer.state_dict(),
+            None if self.dynamic_sigma_optimizer is None else self.dynamic_sigma_optimizer.state_dict(),
         )
 
     def restore(self, model_args, training_args):
-        (
-            self.target_gaussians,
-            self.optimizer_type,
-            self.init_range,
-            self.num_beams,
-            self.num_subcarriers,
-            plane_center,
-            plane_log_sigma,
-            opacity,
-            opt_dict,
-            dynamic_gain_net_dict,
-            dynamic_gain_opt_dict,
-        ) = model_args
+        self.target_gaussians = model_args[0]
+        self.optimizer_type = model_args[1]
+        self.init_range = model_args[2]
+        self.num_beams = model_args[3]
+        self.num_subcarriers = model_args[4]
+        plane_center = model_args[5]
+        plane_log_sigma = model_args[6]
+        opacity = model_args[7]
+        opt_dict = model_args[8] if len(model_args) > 8 else None
+        dynamic_gain_net_dict = model_args[9] if len(model_args) > 9 else None
+        dynamic_gain_opt_dict = model_args[10] if len(model_args) > 10 else None
+        dynamic_center_net_dict = model_args[11] if len(model_args) > 11 else None
+        dynamic_sigma_net_dict = model_args[12] if len(model_args) > 12 else None
+        dynamic_center_opt_dict = model_args[13] if len(model_args) > 13 else None
+        dynamic_sigma_opt_dict = model_args[14] if len(model_args) > 14 else None
 
         self._plane_center = nn.Parameter(plane_center.to(self.device).requires_grad_(True))
         self._plane_log_sigma = nn.Parameter(plane_log_sigma.to(self.device).requires_grad_(True))
@@ -386,8 +454,20 @@ class GaussianModel:
         if dynamic_gain_net_dict is not None:
             self.dynamic_gain_net.load_state_dict(dynamic_gain_net_dict)
 
+        if dynamic_center_net_dict is not None:
+            self.dynamic_center_net.load_state_dict(dynamic_center_net_dict)
+
+        if dynamic_sigma_net_dict is not None:
+            self.dynamic_sigma_net.load_state_dict(dynamic_sigma_net_dict)
+
         if dynamic_gain_opt_dict is not None and self.dynamic_gain_optimizer is not None:
             self.dynamic_gain_optimizer.load_state_dict(dynamic_gain_opt_dict)
+
+        if dynamic_center_opt_dict is not None and self.dynamic_center_optimizer is not None:
+            self.dynamic_center_optimizer.load_state_dict(dynamic_center_opt_dict)
+
+        if dynamic_sigma_opt_dict is not None and self.dynamic_sigma_optimizer is not None:
+            self.dynamic_sigma_optimizer.load_state_dict(dynamic_sigma_opt_dict)
 
     # ------------------------------------------------------------------
     # Optimizer
@@ -413,13 +493,35 @@ class GaussianModel:
 
         self.dynamic_gain_optimizer = torch.optim.Adam(
             self.dynamic_gain_net.parameters(),
-            lr=training_args.dynamic_gain_lr,
+            lr=getattr(training_args, "dynamic_gain_lr", 0.001),
+            eps=1e-8,
+        )
+        self.dynamic_center_optimizer = torch.optim.Adam(
+            self.dynamic_center_net.parameters(),
+            lr=getattr(training_args, "dynamic_center_lr", 0.001),
+            eps=1e-8,
+        )
+        self.dynamic_sigma_optimizer = torch.optim.Adam(
+            self.dynamic_sigma_net.parameters(),
+            lr=getattr(training_args, "dynamic_sigma_lr", 0.001),
             eps=1e-8,
         )
 
         self.dynamic_gain_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.dynamic_gain_lr,
-            lr_final=training_args.dynamic_gain_lr_final,
+            lr_init=getattr(training_args, "dynamic_gain_lr", 0.001),
+            lr_final=getattr(training_args, "dynamic_gain_lr_final", 0.0001),
+            lr_delay_mult=1.0,
+            max_steps=training_args.iterations,
+        )
+        self.dynamic_center_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "dynamic_center_lr", 0.001),
+            lr_final=getattr(training_args, "dynamic_center_lr_final", 0.0001),
+            lr_delay_mult=1.0,
+            max_steps=training_args.iterations,
+        )
+        self.dynamic_sigma_scheduler_args = get_expon_lr_func(
+            lr_init=getattr(training_args, "dynamic_sigma_lr", 0.001),
+            lr_final=getattr(training_args, "dynamic_sigma_lr_final", 0.0001),
             lr_delay_mult=1.0,
             max_steps=training_args.iterations,
         )
@@ -429,6 +531,14 @@ class GaussianModel:
             gain_lr = self.dynamic_gain_scheduler_args(iteration)
             for param_group in self.dynamic_gain_optimizer.param_groups:
                 param_group["lr"] = gain_lr
+        if self.dynamic_center_optimizer is not None:
+            center_lr = self.dynamic_center_scheduler_args(iteration)
+            for param_group in self.dynamic_center_optimizer.param_groups:
+                param_group["lr"] = center_lr
+        if self.dynamic_sigma_optimizer is not None:
+            sigma_lr = self.dynamic_sigma_scheduler_args(iteration)
+            for param_group in self.dynamic_sigma_optimizer.param_groups:
+                param_group["lr"] = sigma_lr
 
     def _build_condition_feature(self, rx_pos: torch.Tensor) -> torch.Tensor:
         rx = rx_pos.view(1, 3).to(self.device, dtype=self.get_xyz.dtype)
@@ -448,13 +558,66 @@ class GaussianModel:
         rx_pos = rx_pos.view(1, 3).to(self.device, dtype=self._plane_center.dtype)
         rx_expand = rx_pos.expand(self._plane_center.shape[0], -1)
 
-        beam_norm = 2.0 * self._plane_center[:, 0:1] / max(self.num_beams - 1, 1) - 1.0
-        subc_norm = 2.0 * self._plane_center[:, 1:2] / max(self.num_subcarriers - 1, 1) - 1.0
+        beam_norm, subc_norm = self._get_normalized_plane_center()
         plane_coord_norm = torch.cat([beam_norm, subc_norm], dim=-1)
 
         dyn = F.softplus(self.dynamic_gain_net(plane_coord_norm, rx_expand))
         gain = self.get_opacity * dyn
         return gain
+
+    def _get_normalized_plane_center(self):
+        beam_norm = 2.0 * self._plane_center[:, 0:1] / max(self.num_beams - 1, 1) - 1.0
+        subc_norm = 2.0 * self._plane_center[:, 1:2] / max(self.num_subcarriers - 1, 1) - 1.0
+        return beam_norm, subc_norm
+
+    def get_dynamic_plane_center(self, rx_pos: torch.Tensor) -> torch.Tensor:
+        if not self.use_dynamic_center:
+            return self.get_plane_center
+
+        rx_pos = rx_pos.view(1, 3).to(self.device, dtype=self._plane_center.dtype)
+        rx_expand = rx_pos.expand(self._plane_center.shape[0], -1)
+
+        beam_norm, subc_norm = self._get_normalized_plane_center()
+        plane_coord_norm = torch.cat([beam_norm, subc_norm], dim=-1)
+
+        raw_delta_center = self.dynamic_center_net(plane_coord_norm, rx_expand)
+        bounded_delta = torch.tanh(raw_delta_center)
+
+        delta_beam = bounded_delta[:, 0] * self.center_shift_max_beam
+        delta_subc = bounded_delta[:, 1] * self.center_shift_max_subcarrier
+        delta_center = torch.stack([delta_beam, delta_subc], dim=-1)
+
+        dynamic_center = self._plane_center + delta_center
+        beam_center = dynamic_center[:, 0].clamp(
+            min=0.0, max=float(max(self.num_beams - 1, 0))
+        )
+        subc_center = dynamic_center[:, 1].clamp(
+            min=0.0, max=float(max(self.num_subcarriers - 1, 0))
+        )
+        return torch.stack([beam_center, subc_center], dim=-1)
+
+    def get_dynamic_plane_sigma(self, rx_pos: torch.Tensor) -> torch.Tensor:
+        if not self.use_dynamic_sigma:
+            return self.get_plane_sigma
+
+        rx_pos = rx_pos.view(1, 3).to(self.device, dtype=self._plane_center.dtype)
+        rx_expand = rx_pos.expand(self._plane_center.shape[0], -1)
+
+        beam_norm, subc_norm = self._get_normalized_plane_center()
+        plane_coord_norm = torch.cat([beam_norm, subc_norm], dim=-1)
+
+        raw_delta_log_sigma = self.dynamic_sigma_net(plane_coord_norm, rx_expand)
+        bounded_delta = torch.tanh(raw_delta_log_sigma)
+
+        delta_log_sigma_beam = bounded_delta[:, 0] * self.sigma_log_shift_max_beam
+        delta_log_sigma_subc = bounded_delta[:, 1] * self.sigma_log_shift_max_subcarrier
+        delta_log_sigma = torch.stack([delta_log_sigma_beam, delta_log_sigma_subc], dim=-1)
+
+        dynamic_log_sigma = self._plane_log_sigma + delta_log_sigma
+        dynamic_sigma = torch.exp(dynamic_log_sigma).clamp(
+            min=self.plane_min_sigma, max=self.plane_max_sigma
+        )
+        return dynamic_sigma
 
     def get_dynamic_spectral_profile(self, rx_pos, num_subcarriers=None):
         feat = self._build_condition_feature(rx_pos)
