@@ -64,7 +64,7 @@ class Scene:
         self.gaussians = gaussians
 
         self.batch_size = 1 # batch size is fixed to 1
-        self.num_epochs = 20
+        self.num_epochs = 50
 
         self.datadir = os.path.abspath(args.source_path)
 

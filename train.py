@@ -14,7 +14,7 @@ from gaussian_renderer.beam_subcarrier import render_beam_subcarrier
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from torch.utils.data import DataLoader, Subset
-from utils.loss import (hybrid_magnitude_loss, magnitude_mse_loss, normalize_mag_map, weighted_l1_loss, topk_shape_loss)
+from utils.loss import (hybrid_magnitude_loss, magnitude_mse_loss, normalize_mag_map, weighted_l1_loss)
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.ticker import FormatStrFormatter
 
@@ -56,7 +56,7 @@ def evaluate_and_save_random_test_samples(
 ):
     save_dir = os.path.join(model_params.model_path, "pred_compare")
     os.makedirs(save_dir, exist_ok=True)
-    npy_path = os.path.join(model_params.model_path, "pred_compare_samples.npy")
+    npy_path = os.path.join(model_params.model_path, "compare_samples.npy")
 
     total = len(scene.test_set)
     num_samples = min(num_samples, total)
@@ -249,6 +249,17 @@ def training(model_params, opt_params, raw_args):
     total_iterations = len(scene.train_iter) * num_epochs
     opt_params.position_lr_max_steps = int(0.6 * total_iterations) 
     gaussians.training_setup(opt_params)
+    densify_start_iter = 3000
+    densify_end_iter = 30000
+    densify_interval = 2000
+    opacity_reset_interval = 3000
+    importance_quantile = 0.90
+    clone_sigma_threshold = 0.45
+    split_sigma_threshold = 0.55
+    min_opacity = 0.01
+    max_gaussians = 80000
+    n_splits = 2
+    opacity_reset_cap = 0.05
 
     tx_pos = torch.tensor(
         scene.bs_position,
@@ -287,8 +298,8 @@ def training(model_params, opt_params, raw_args):
                 dbg_out = render_sample(dbg_rx)
                 dbg_pred_mag = dbg_out["render"]
 
-                # dbg_gt_shape = normalize_mag_map(dbg_gt_mag)
-                # dbg_pred_shape = normalize_mag_map(dbg_pred_mag)
+                # dbg_gt_mag = normalize_mag_map(dbg_gt_mag)
+                # dbg_pred_mag = normalize_mag_map(dbg_pred_mag)
 
                 loss_val = weighted_l1_loss(dbg_pred_mag, dbg_gt_mag).item()
                 zero_val = torch.mean(torch.abs(dbg_gt_mag)).item()
@@ -355,6 +366,9 @@ def training(model_params, opt_params, raw_args):
             #     return_terms=True,
             # )
 
+            # pred_mag = normalize_mag_map(pred_mag)
+            # gt_mag = normalize_mag_map(gt_mag)
+
             loss = weighted_l1_loss(pred_mag, gt_mag)
 
             assert_finite("loss", loss, iteration)
@@ -372,20 +386,32 @@ def training(model_params, opt_params, raw_args):
             gaussians.dynamic_center_optimizer.step()
             gaussians.dynamic_sigma_optimizer.step()
 
+            if (
+                iteration >= densify_start_iter
+                and iteration <= densify_end_iter
+                and iteration % densify_interval == 0
+            ):
+                with torch.no_grad():
+                    before_count = gaussians.get_plane_center.shape[0]
+                    gaussians.adaptive_density_control_2d(
+                        importance_quantile=importance_quantile,
+                        clone_sigma_threshold=clone_sigma_threshold,
+                        split_sigma_threshold=split_sigma_threshold,
+                        min_opacity=min_opacity,
+                        max_gaussians=max_gaussians,
+                        n_splits=n_splits,
+                    )
+                    after_count = gaussians.get_plane_center.shape[0]
+                    print(f"[Density2D] iter={iteration} count {before_count} -> {after_count}")
 
-            # Densify and prune OFF FOR DEBUGGING
-            # if iteration > 1000 and iteration < 15000 and iteration % 1000 == 0:
-            #     with torch.no_grad():
-            #         gaussians.densify_and_prune(
-            #             max_grad = 1e-4,
-            #             min_opacity = 1e-3,
-            #             min_gain_mag = 1e-4,
-            #             clone_scale_threshold=0.05,
-            #             split_scale_threshold=0.20,
-            #             importance_threshold=0.0,
-            #             max_scale = None,
-            #             n_splits = 2,
-            #         )
+            if (
+                iteration >= densify_start_iter
+                and iteration <= densify_end_iter
+                and iteration % opacity_reset_interval == 0
+            ):
+                with torch.no_grad():
+                    gaussians.reset_opacity(max_opacity=opacity_reset_cap)
+                    print(f"[Density2D] iter={iteration} opacity reset (cap={opacity_reset_cap:.3f})")
             
             if iteration > 1000 and iteration % 1000 == 0:
 

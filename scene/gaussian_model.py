@@ -857,6 +857,222 @@ class GaussianModel:
         return optimizable_tensors
 
     # ------------------------------------------------------------------
+    # 2D plane adaptive density control
+    # ------------------------------------------------------------------
+    def _prune_optimizer_2d(self, mask: torch.Tensor):
+        optimizable_tensors = {}
+        target_groups = {"plane_center", "plane_sigma", "opacity"}
+        for group in self.optimizer.param_groups:
+            group_name = group.get("name")
+            if group_name not in target_groups:
+                continue
+
+            old_param = group["params"][0]
+            stored_state = self.optimizer.state.get(old_param, None)
+            new_tensor = old_param[mask]
+
+            if stored_state is not None:
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                del self.optimizer.state[old_param]
+                group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
+                self.optimizer.state[group["params"][0]] = stored_state
+            else:
+                group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
+
+            optimizable_tensors[group_name] = group["params"][0]
+
+        return optimizable_tensors
+
+    def cat_tensors_to_optimizer_2d(self, tensors_dict: Dict[str, torch.Tensor]):
+        optimizable_tensors = {}
+        target_groups = {"plane_center", "plane_sigma", "opacity"}
+        for group in self.optimizer.param_groups:
+            group_name = group.get("name")
+            if group_name not in target_groups:
+                continue
+
+            extension_tensor = tensors_dict[group_name]
+            old_param = group["params"][0]
+            stored_state = self.optimizer.state.get(old_param, None)
+            new_tensor = torch.cat((old_param, extension_tensor), dim=0)
+
+            if stored_state is not None:
+                stored_state["exp_avg"] = torch.cat(
+                    (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+                )
+                stored_state["exp_avg_sq"] = torch.cat(
+                    (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0
+                )
+                del self.optimizer.state[old_param]
+                group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
+                self.optimizer.state[group["params"][0]] = stored_state
+            else:
+                group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
+
+            optimizable_tensors[group_name] = group["params"][0]
+
+        return optimizable_tensors
+
+    def densification_postfix_2d(
+        self,
+        new_plane_center: torch.Tensor,
+        new_plane_log_sigma: torch.Tensor,
+        new_opacity: torch.Tensor,
+    ):
+        tensors_dict = {
+            "plane_center": new_plane_center,
+            "plane_sigma": new_plane_log_sigma,
+            "opacity": new_opacity,
+        }
+        optimizable_tensors = self.cat_tensors_to_optimizer_2d(tensors_dict)
+        self._plane_center = optimizable_tensors["plane_center"]
+        self._plane_log_sigma = optimizable_tensors["plane_sigma"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._reset_statistics()
+
+    def prune_points_2d(self, prune_mask: torch.Tensor):
+        valid_points_mask = ~prune_mask
+        optimizable_tensors = self._prune_optimizer_2d(valid_points_mask)
+        self._plane_center = optimizable_tensors["plane_center"]
+        self._plane_log_sigma = optimizable_tensors["plane_sigma"]
+        self._opacity = optimizable_tensors["opacity"]
+        self.importance_accum = self.importance_accum[valid_points_mask]
+        self.importance_denom = self.importance_denom[valid_points_mask]
+
+    def densify_and_clone_2d(self, selected_mask: torch.Tensor):
+        if int(selected_mask.sum().item()) == 0:
+            return
+
+        base_center = self._plane_center[selected_mask]
+        sigma = self.get_plane_sigma[selected_mask]
+        jitter = torch.randn_like(base_center) * (0.15 * sigma)
+        new_center = base_center + jitter
+        beam = new_center[:, 0].clamp(min=0.0, max=float(max(self.num_beams - 1, 0)))
+        subc = new_center[:, 1].clamp(min=0.0, max=float(max(self.num_subcarriers - 1, 0)))
+        new_plane_center = torch.stack([beam, subc], dim=-1)
+
+        new_plane_log_sigma = self._plane_log_sigma[selected_mask].clone()
+        parent_opacity = self.get_opacity[selected_mask]
+        new_opacity_value = torch.clamp(parent_opacity * 0.25, min=1e-4, max=0.99)
+        new_opacity_raw = inverse_sigmoid(new_opacity_value)
+
+        self.densification_postfix_2d(
+            new_plane_center=new_plane_center,
+            new_plane_log_sigma=new_plane_log_sigma,
+            new_opacity=new_opacity_raw,
+        )
+
+    def densify_and_split_2d(self, selected_mask: torch.Tensor, n_splits: int = 2):
+        n_selected = int(selected_mask.sum().item())
+        if n_selected == 0:
+            return
+
+        parent_center = self._plane_center[selected_mask]
+        parent_sigma = self.get_plane_sigma[selected_mask]
+        repeated_parent_center = parent_center.repeat(n_splits, 1)
+        repeated_parent_sigma = parent_sigma.repeat(n_splits, 1)
+        offsets = torch.randn((n_selected * n_splits, 2), device=self.device) * repeated_parent_sigma
+        child_center = repeated_parent_center + offsets
+        child_beam = child_center[:, 0].clamp(min=0.0, max=float(max(self.num_beams - 1, 0)))
+        child_subc = child_center[:, 1].clamp(min=0.0, max=float(max(self.num_subcarriers - 1, 0)))
+        child_plane_center = torch.stack([child_beam, child_subc], dim=-1)
+
+        child_sigma = torch.clamp(
+            repeated_parent_sigma / 1.6,
+            min=self.plane_min_sigma,
+            max=self.plane_max_sigma,
+        )
+        child_log_sigma = torch.log(child_sigma)
+
+        parent_opacity = self.get_opacity[selected_mask]
+        repeated_parent_opacity = parent_opacity.repeat(n_splits, 1)
+        child_opacity_value = torch.clamp(
+            repeated_parent_opacity / float(n_splits),
+            min=1e-4,
+            max=0.99,
+        )
+        child_opacity_raw = inverse_sigmoid(child_opacity_value)
+
+        self.densification_postfix_2d(
+            new_plane_center=child_plane_center,
+            new_plane_log_sigma=child_log_sigma,
+            new_opacity=child_opacity_raw,
+        )
+
+        prune_filter = torch.cat(
+            (
+                selected_mask,
+                torch.zeros(n_selected * n_splits, device=self.device, dtype=torch.bool),
+            ),
+            dim=0,
+        )
+        self.prune_points_2d(prune_filter)
+
+    def adaptive_density_control_2d(
+        self,
+        importance_quantile: float,
+        clone_sigma_threshold: float,
+        split_sigma_threshold: float,
+        min_opacity: float,
+        max_gaussians: int,
+        n_splits: int = 2,
+    ):
+        avg_importance = self.get_avg_importance().squeeze(-1)
+        positive_mask = avg_importance > 0
+        if int(positive_mask.sum().item()) == 0:
+            return
+
+        threshold = torch.quantile(avg_importance[positive_mask], importance_quantile)
+        important_mask = avg_importance >= threshold
+        sigma_max = self.get_plane_sigma.max(dim=1).values
+        clone_mask = important_mask & (sigma_max <= clone_sigma_threshold)
+        split_mask = important_mask & (sigma_max > split_sigma_threshold)
+
+        current_n = self._plane_center.shape[0]
+        budget = max_gaussians - current_n
+        if budget <= 0:
+            low_opacity_mask = self.get_opacity.squeeze(-1) < min_opacity
+            if int(low_opacity_mask.sum().item()) > 0:
+                self.prune_points_2d(low_opacity_mask)
+            self._reset_statistics()
+            return
+
+        selected_clone_mask = torch.zeros_like(clone_mask)
+        selected_split_mask = torch.zeros_like(split_mask)
+        candidate_mask = clone_mask | split_mask
+        if int(candidate_mask.sum().item()) > 0:
+            candidate_idx = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
+            candidate_imp = avg_importance[candidate_idx]
+            topk = min(int(candidate_idx.numel()), int(budget))
+            top_idx = torch.topk(candidate_imp, k=topk, largest=True).indices
+            selected_idx = candidate_idx[top_idx]
+            selected_parent_mask = torch.zeros_like(candidate_mask)
+            selected_parent_mask[selected_idx] = True
+            selected_clone_mask = selected_parent_mask & clone_mask
+            selected_split_mask = selected_parent_mask & split_mask
+
+        if int(selected_clone_mask.sum().item()) > 0:
+            self.densify_and_clone_2d(selected_clone_mask)
+
+        if int(selected_split_mask.sum().item()) > 0:
+            clone_added = int(selected_clone_mask.sum().item())
+            split_mask_current = torch.cat(
+                (
+                    selected_split_mask,
+                    torch.zeros(clone_added, device=self.device, dtype=torch.bool),
+                ),
+                dim=0,
+            )
+            self.densify_and_split_2d(split_mask_current, n_splits=n_splits)
+
+        low_opacity_mask = self.get_opacity.squeeze(-1) < min_opacity
+        if int(low_opacity_mask.sum().item()) > 0:
+            self.prune_points_2d(low_opacity_mask)
+
+        self._reset_statistics()
+
+    # ------------------------------------------------------------------
     # Prune / densify
     # ------------------------------------------------------------------
 
