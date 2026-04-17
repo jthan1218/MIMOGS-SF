@@ -99,9 +99,9 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr_final = 0.003
 
         # dynamic gain head only
-        self.dynamic_gain_lr = 0.001
+        self.dynamic_gain_lr = 0.002
         self.dynamic_gain_lr_final = 0.0001
-        self.dynamic_center_lr = 0.001
+        self.dynamic_center_lr = 0.002
         self.dynamic_center_lr_final = 0.0001
         self.dynamic_sigma_lr = 0.001
         self.dynamic_sigma_lr_final = 0.0001
